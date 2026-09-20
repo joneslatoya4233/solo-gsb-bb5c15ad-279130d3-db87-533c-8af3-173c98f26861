@@ -125,6 +125,17 @@
   中仅 seq、event_hash 参与重算）。首个失败阶段按 event_count -> events ->
   proof_nodes -> merkle_root -> snapshot_digest 顺序返回；重复或越界序号、
   缺失或多余节点、坐标冲突、不符合奇数层自复制规则的证明一律拒绝。
+
+交接事件审计检索（GET /audit/events）
+-------------------------------------
+跨链审计检索的实现位于 audit.py：过滤条件为 chain_id / holder / role
+（giver / receiver / either）/ created_from / created_to，跨链按
+(created_at, 事件数据库 id) 升序返回。创世事件（seq=0）无 giver /
+receiver，仅在 role=either 时按 chains.first_holder 匹配持有人。首次查询在
+同一读事务内把当时 MAX(events.id) 固定为快照上界，签名游标携带过滤条件摘要、
+上界与末条排序键（HMAC-SHA256，密钥 AUDIT_CURSOR_SECRET），保证翻页期间新
+追加的移交不进入旧快照、不重不漏；游标损坏或过滤条件不符一律 400 且不回退
+为新查询。
 """
 from __future__ import annotations
 

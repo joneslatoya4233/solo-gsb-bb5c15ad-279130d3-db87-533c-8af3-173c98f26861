@@ -5,7 +5,8 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     DATA_DIR=/data \
     HOST=0.0.0.0 \
-    PORT=8000
+    PORT=8000 \
+    AUDIT_CURSOR_SECRET=dev-only-audit-cursor-secret-change-me
 
 WORKDIR /app
 

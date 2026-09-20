@@ -164,6 +164,54 @@ class ChainSummary(BaseModel):
     created_at: str
 
 
+class AuditEventOut(BaseModel):
+    """审计检索命中的交接事件（跨链统一视图，含事件数据库 id 与链 id）。"""
+
+    id: int = Field(
+        ...,
+        description=(
+            "事件数据库自增 id：与 created_at 共同构成跨链稳定排序键，"
+            "同秒内多个事件按 id 定先后；仅追加、不回收"
+        ),
+    )
+    chain_id: str = Field(..., description="事件所属交接链 ID")
+    seq: int = Field(..., description="链内序号：0 为创世事件，>=1 为移交事件")
+    giver: str = Field(
+        ...,
+        description=(
+            "交出方标识；创世事件为空串（其持有人以链条 first_holder 表达，"
+            "仅在 role=either 时参与持有人匹配）"
+        ),
+    )
+    receiver: str = Field(..., description="接收方标识；创世事件为空串")
+    nonce: str = Field(..., description="一次性随机数；创世事件为空串")
+    prev_hash: str = Field(..., description="前序事件哈希；创世事件为空串")
+    event_hash: str
+    created_at: str = Field(..., description="事件创建时刻（UTC ISO-8601）")
+
+
+class AuditEventsPage(BaseModel):
+    events: list[AuditEventOut] = Field(
+        ...,
+        description=(
+            "本页事件：跨链按 (created_at, id) 升序；数量不超过 limit。"
+            "结果锚定首次查询时刻的快照（当时最大事件 id），翻页期间新追加的"
+            "移交不会插入本查询，不会重复也不会漏项"
+        ),
+    )
+    next_cursor: Optional[str] = Field(
+        ...,
+        description=(
+            "下一页不透明游标：内含过滤条件摘要、快照上界与末条排序键，并用"
+            " AUDIT_CURSOR_SECRET 做 HMAC 签名；回传时须保持 chain_id/holder/"
+            "role/created_from/created_to 与首次查询完全一致（limit 可调整）。"
+            "游标损坏/被篡改返回 400 invalid_cursor_signature，与本次过滤条件"
+            "不符返回 400 cursor_filter_mismatch，均不会回退为新查询；"
+            "无更多项时为 null"
+        ),
+    )
+
+
 class HandoverResult(BaseModel):
     chain_id: str
     seq: int

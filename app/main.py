@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from typing import Literal, Optional
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import config, database
+from . import audit, config, database
 from .schemas import (
+    AuditEventsPage,
     BatchProofVerifyRequest,
     BatchProofVerifyResult,
     ChainOut,
@@ -71,7 +73,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="文件交接留痕服务",
     description="基于 SHA-256 哈希链的多人文件交接记录、查询与完整性校验。",
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -87,6 +89,90 @@ async def chain_error_handler(request: Request, exc: ChainError) -> JSONResponse
 @app.get("/health", response_model=HealthOut, tags=["meta"], summary="健康检查")
 def health() -> HealthOut:
     return HealthOut(status="ok")
+
+
+@app.get(
+    "/audit/events",
+    response_model=AuditEventsPage,
+    tags=["audit"],
+    summary="交接事件审计检索（跨链快照分页）",
+    description=(
+        "跨全部交接链检索事件：支持 chain_id、holder、role（giver / receiver / "
+        "either，默认 either）、created_from、created_to（ISO-8601 闭区间，"
+        "朴素时间按 UTC 解释）与 limit（1～100，默认 50）。结果跨链按 "
+        "(created_at, id) 升序返回。\n\n"
+        "创世事件（seq=0）没有交出/接收方：**仅在 role=either 时**按链条首位"
+        "持有人 first_holder 匹配 holder；role=giver / receiver 时创世事件不"
+        "入选。\n\n"
+        "**快照一致性翻页**：首次查询在同一读事务内把「当时最大的事件数据库 "
+        "id」固定为快照上界，随后只在该不可变集合内翻页；翻页期间新追加的"
+        "移交不会进入本次查询，因而不会重复或漏项。响应 next_cursor 携带过滤"
+        "条件摘要、快照上界与末条排序键，并以 AUDIT_CURSOR_SECRET 做 "
+        "HMAC-SHA256 签名。后续请求通过 next_cursor 查询参数原样回传游标，且"
+        " chain_id/holder/role/created_from/created_to 必须与首次查询完全一致"
+        "（仅 limit 可变）；游标损坏或被篡改返回 **400 invalid_cursor_signature**，"
+        "格式非法返回 **400 invalid_cursor**，过滤条件不符返回 **400 "
+        "cursor_filter_mismatch**——**一律不会回退为一次新的快照查询**。"
+        "created_from 晚于 created_to 返回 400 invalid_time_range；提供 role "
+        "却未提供 holder 返回 400 role_requires_holder。无更多项时 "
+        "next_cursor 为 null。"
+    ),
+)
+def api_audit_events(
+    chain_id: Optional[str] = Query(
+        None,
+        min_length=1,
+        max_length=200,
+        description="仅检索指定交接链的事件；省略则跨全部链",
+    ),
+    holder: Optional[str] = Query(
+        None,
+        min_length=1,
+        max_length=200,
+        description=(
+            "按持有人标识过滤；须配合 role 使用（缺省 role 视为 either）"
+        ),
+    ),
+    role: Optional[Literal["giver", "receiver", "either"]] = Query(
+        None,
+        description=(
+            "持有人参与角色：giver（交出方）/ receiver（接收方）/ either"
+            "（任一，默认）。创世事件仅在 either 时按首位持有人匹配"
+        ),
+    ),
+    created_from: Optional[str] = Query(
+        None,
+        description="创建时间下界（含），ISO-8601，如 2026-09-01T00:00:00+00:00",
+    ),
+    created_to: Optional[str] = Query(
+        None,
+        description="创建时间上界（含），ISO-8601，如 2026-09-30T23:59:59+00:00",
+    ),
+    limit: int = Query(
+        50,
+        ge=1,
+        le=100,
+        description="每页事件数，1～100；翻页时可在各页之间调整",
+    ),
+    next_cursor: Optional[str] = Query(
+        None,
+        description=(
+            "上一页响应中的 next_cursor 原样回传；过滤条件须与首次查询一致，"
+            "游标被篡改或条件不符返回 400 且不会回退为新查询"
+        ),
+    ),
+) -> AuditEventsPage:
+    return AuditEventsPage(
+        **audit.search_audit_events(
+            chain_id=chain_id,
+            holder=holder,
+            role=role,
+            created_from=created_from,
+            created_to=created_to,
+            limit=limit,
+            cursor=next_cursor,
+        )
+    )
 
 
 @app.post(

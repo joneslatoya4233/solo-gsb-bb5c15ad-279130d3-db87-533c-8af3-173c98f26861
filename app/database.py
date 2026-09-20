@@ -3,7 +3,9 @@
 五张表：
 - chains：链条头信息与链尾缓存（tail_hash / current_holder 是事件表的可信投影）
 - events：链上的全部事件，序号 0 为创世记录（文件摘要 + 首位持有人），
-  序号 >=1 为移交记录。
+  序号 >=1 为移交记录。自增 id 单调递增，除链内 (chain_id, seq) 索引外还建有
+  (created_at, id) 复合索引，供交接事件审计检索（GET /audit/events）跨链按
+  创建时间与 id 稳定排序、键集翻页。
 - offers：待接收移交邀约。只保存一次性确认码的 SHA-256 摘要（code_digest），
   不保存明文；tail_hash 记录邀约发起时锁定的链尾，确认时必须仍然匹配。
   witness_threshold 为 NULL 表示无见证邀约（兼容存量数据），否则为通过阈值。
@@ -111,6 +113,11 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_chain_seq
     ON events(chain_id, seq);
+
+-- 交接事件审计检索（GET /audit/events）跨链按 (created_at, id) 升序翻页：
+-- 复合索引覆盖排序与键集翻页的 created_at/id 比较；事件只追加，建索引无写放大顾虑。
+CREATE INDEX IF NOT EXISTS idx_events_created_id
+    ON events(created_at, id);
 
 CREATE TABLE IF NOT EXISTS offers (
 {_OFFERS_COLUMNS}
