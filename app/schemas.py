@@ -983,3 +983,57 @@ class SealOut(BaseModel):
 
 class HealthOut(BaseModel):
     status: str
+
+
+class AuditEventOut(BaseModel):
+    """审计检索命中的交接事件：相比链内事件额外给出全局事件库 id 与 chain_id。"""
+
+    id: int = Field(
+        ...,
+        description=(
+            "事件数据库自增 id（跨链全局单调），与 created_at 共同构成翻页排序键"
+        ),
+    )
+    chain_id: str = Field(..., description="事件所属交接链 ID")
+    seq: int = Field(..., description="链内序号：0 为创世事件，>=1 为移交事件")
+    prev_hash: str
+    giver: str = Field(
+        ...,
+        description=(
+            "交出方；创世事件（seq=0）为空串——其持有人语义由首位持有人表达，"
+            "仅在 role=either 时按 chains.first_holder 参与持有人匹配"
+        ),
+    )
+    receiver: str = Field(..., description="接收方；创世事件（seq=0）为空串")
+    nonce: str = Field(..., description="一次性随机数；创世事件为空串")
+    event_hash: str
+    created_at: str = Field(
+        ..., description="事件落库时刻（UTC ISO-8601，秒精度）；翻页排序键之一"
+    )
+
+
+class AuditEventsOut(BaseModel):
+    events: list[AuditEventOut] = Field(
+        ...,
+        description=(
+            "命中的交接事件，跨链按 (created_at, 事件数据库 id) 升序排列；"
+            "页内最多 limit 条"
+        ),
+    )
+    next_cursor: Optional[str] = Field(
+        default=None,
+        description=(
+            "下一页游标（不透明令牌）：已携带过滤条件摘要、首次查询固定的快照"
+            "上界与本页末条排序键，并以服务端 AUDIT_CURSOR_SECRET 做 HMAC 签名；"
+            "原样作为 cursor 查询参数继续翻页。无更多项时为 null；游标被篡改或"
+            "与本次过滤条件不符返回 400，不会回退为新查询"
+        ),
+    )
+    snapshot_max_id: int = Field(
+        ...,
+        description=(
+            "本次遍历的快照上界（首次查询时刻的最大事件数据库 id）：仅 id 不"
+            "大于该值的事件参与本次及后续翻页，翻页期间的新增移交不会造成重复"
+            "或漏项；空库首次查询为 0"
+        ),
+    )

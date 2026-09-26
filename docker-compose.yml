@@ -8,6 +8,12 @@ services:
     environment:
       DATA_DIR: /data
       PORT: "8000"
+      # 审计检索翻页游标的 HMAC 签名密钥。
+      # 此处给出可被外部环境覆盖的开发默认值，保证 `docker compose up` 一键启动；
+      # 生产部署必须覆盖，例如：
+      #   AUDIT_CURSOR_SECRET="$(openssl rand -hex 32)" docker compose up -d
+      # 或在 .env / shell 环境中导出 AUDIT_CURSOR_SECRET。换钥后旧游标立即失效。
+      AUDIT_CURSOR_SECRET: "${AUDIT_CURSOR_SECRET:-dev-only-insecure-audit-cursor-secret-change-me}"
     volumes:
       - handoff-data:/data
     restart: unless-stopped

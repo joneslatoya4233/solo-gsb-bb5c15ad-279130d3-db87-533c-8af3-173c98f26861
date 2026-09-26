@@ -1,13 +1,17 @@
 """FastAPI 入口：多人文件交接留痕（哈希链）服务。"""
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
+from typing import Literal, Optional
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import config, database
+from .audit import AuditError
 from .schemas import (
+    AuditEventsOut,
     BatchProofVerifyRequest,
     BatchProofVerifyResult,
     ChainOut,
@@ -37,6 +41,8 @@ from .schemas import (
     WitnessStatusOut,
 )
 from .service import (
+    AUDIT_LIMIT_MAX,
+    AUDIT_LIMIT_MIN,
     ChainError,
     append_handover,
     cancel_offer,
@@ -55,23 +61,31 @@ from .service import (
     record_witness_decision,
     release_seal,
     replace_offer,
+    search_audit_events,
     verify_batch_proof,
     verify_chain,
     verify_event_proof,
 )
+
+logger = logging.getLogger("handoff-chain")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动即完成数据库初始化（建表 / 校验目录）
     database.init_db()
+    if config.AUDIT_CURSOR_SECRET == config.AUDIT_CURSOR_SECRET_DEFAULT:
+        logger.warning(
+            "AUDIT_CURSOR_SECRET 未设置，正在使用内置开发默认密钥；"
+            "生产部署必须通过环境变量覆盖（旧游标在换钥后立即失效）。"
+        )
     yield
 
 
 app = FastAPI(
     title="文件交接留痕服务",
     description="基于 SHA-256 哈希链的多人文件交接记录、查询与完整性校验。",
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -80,6 +94,16 @@ app = FastAPI(
 async def chain_error_handler(request: Request, exc: ChainError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code,
+        content={"error": exc.code, "detail": exc.message},
+    )
+
+
+@app.exception_handler(AuditError)
+async def audit_error_handler(request: Request, exc: AuditError) -> JSONResponse:
+    # 审计检索的全部客户端错误（游标篡改/条件不符/参数非法）统一为 400，
+    # 绝不因游标无效而静默回退为一次新查询。
+    return JSONResponse(
+        status_code=400,
         content={"error": exc.code, "detail": exc.message},
     )
 
@@ -292,6 +316,83 @@ def api_get_offer(offer_id: str) -> OfferStatusOut:
 )
 def api_list_chains() -> list[ChainSummary]:
     return [ChainSummary(**c) for c in list_chains()]
+
+
+@app.get(
+    "/audit/events",
+    response_model=AuditEventsOut,
+    tags=["audit"],
+    summary="交接事件审计检索（跨链、快照一致的签名游标翻页）",
+    description=(
+        "跨全部交接链检索创世与移交事件，结果按 (created_at, 事件数据库 id) "
+        "全局升序返回。支持的过滤条件：\n"
+        "- chain_id：限定单条链（可与其他条件组合）；\n"
+        "- holder：按参与方标识过滤；配合 role 选择角色；\n"
+        "- role=giver/receiver：仅匹配移交事件的交出方/接收方；role=either"
+        "（默认）匹配任一参与方，**创世事件仅在 either 时按首位持有人 "
+        "first_holder 匹配**（创世事件没有 giver/receiver 字段）；未提供 "
+        "holder 时不能指定 giver/receiver（400 role_requires_holder）；\n"
+        "- created_from / created_to：按 UTC ISO-8601 闭区间过滤事件 "
+        "created_at（建议显式时区，无时区按 UTC 解释，秒精度比较）；\n"
+        "- limit：每页条数 1～100（默认 50）。\n\n"
+        "**快照与翻页**：首次查询（不带 cursor）在同一读事务内把当时最大事件 "
+        "id 固定为快照上界 snapshot_max_id；后续即使有新移交追加，也只有 id "
+        "不超过该上界的事件参与本次遍历，故翻页不会重复或漏项。next_cursor 是"
+        "携带过滤条件摘要、快照上界与末条排序键的不透明令牌，以服务端 "
+        "AUDIT_CURSOR_SECRET 做 HMAC-SHA256 签名；把它原样作为 cursor 参数"
+        "传回即可。游标被篡改、签名失效或结构非法返回 400 invalid_cursor；"
+        "游标与本次查询的过滤条件（chain_id/holder/role/created_from/"
+        "created_to）不一致返回 400 cursor_filter_mismatch——两者都**不会**"
+        "回退为一次新查询；limit 允许在 1～100 间逐页调整。无更多项时 "
+        "next_cursor 为 null。"
+    ),
+)
+def api_search_audit_events(
+    chain_id: Optional[str] = Query(
+        default=None,
+        description="仅检索该交接链的事件；省略则跨全部链",
+    ),
+    holder: Optional[str] = Query(
+        default=None,
+        description="按参与方标识过滤；省略则返回全部事件（不按参与方过滤）",
+    ),
+    role: Literal["giver", "receiver", "either"] = Query(
+        default="either",
+        description=(
+            "持有人角色：giver（交出方）/ receiver（接收方）/ either（任一，"
+            "默认；创世事件仅在此值下按首位持有人匹配）"
+        ),
+    ),
+    created_from: Optional[str] = Query(
+        default=None,
+        description="创建时间下界（含），UTC ISO-8601，如 2026-09-01T00:00:00+00:00",
+    ),
+    created_to: Optional[str] = Query(
+        default=None,
+        description="创建时间上界（含），UTC ISO-8601，如 2026-09-30T23:59:59+00:00",
+    ),
+    limit: int = Query(
+        default=50,
+        ge=AUDIT_LIMIT_MIN,
+        le=AUDIT_LIMIT_MAX,
+        description=f"每页条数（{AUDIT_LIMIT_MIN}～{AUDIT_LIMIT_MAX}，默认 50）",
+    ),
+    cursor: Optional[str] = Query(
+        default=None,
+        description="上一页响应中的 next_cursor；首次查询省略",
+    ),
+) -> AuditEventsOut:
+    return AuditEventsOut(
+        **search_audit_events(
+            chain_id=chain_id,
+            holder=holder,
+            role=role,
+            created_from=created_from,
+            created_to=created_to,
+            limit=limit,
+            cursor=cursor,
+        )
+    )
 
 
 @app.get(

@@ -129,6 +129,40 @@
      以及 `created_at` / `expires_at` / `released_at` 时间信息；**任何情况下
      都不返回解封码及其摘要**。链条不存在返回 404；该链从未有过封存时链级
      查询返回 **404**（`seal_not_found`）。
+- **交接事件审计检索** `GET /audit/events`：跨全部交接链检索创世与移交事件，
+  供审计/对账使用。结果固定按 **`(created_at, 事件数据库 id)` 全局升序**
+  （`created_at` 精确到秒，同秒事件以数据库自增 id 决胜），支持以下查询参数：
+  - `chain_id`：限定单条链（可与其他条件组合）；
+  - `holder`：按参与方标识过滤；配合 `role` 选择角色：
+    - `role=giver`：仅匹配移交事件的**交出方**；
+    - `role=receiver`：仅匹配移交事件的**接收方**；
+    - `role=either`（默认）：匹配交出方或接收方，并且**创世事件仅在此值下按
+      首位持有人 `first_holder` 匹配**（创世事件没有 giver/receiver 字段，
+      空串不参与精确匹配）；未提供 `holder` 时不能指定 `giver`/`receiver`
+      （**400** `role_requires_holder`）；
+  - `created_from` / `created_to`：按事件 `created_at` 的 **UTC 闭区间**
+    过滤（接受 ISO-8601，建议显式时区；不带时区按 UTC 解释，统一按秒精度
+    比较）；区间倒置返回 **400**（`invalid_time_range`），时间格式非法返回
+    **400**（`invalid_created_from` / `invalid_created_to`）；
+  - `limit`：每页 `1～100` 条（默认 50，越界由参数校验返回 422）。
+  - **快照一致的签名游标翻页**：首次查询（不带 `cursor`）时，服务端在
+    **同一个读事务**内把**当时最大事件 id 固定为快照上界**
+    （响应中的 `snapshot_max_id`；空库为 0）。后续即使有新移交追加，本次
+    遍历始终只包含 `id <= snapshot_max_id` 的事件——因此翻页期间新增的移交
+    **不会插入旧页造成重复，也不会移动末页边界造成漏项**。响应中的
+    `next_cursor` 是携带「过滤条件摘要 + 快照上界 + 上一页末条排序键」的
+    **不透明令牌**，以服务端密钥 `AUDIT_CURSOR_SECRET` 做 **HMAC-SHA256**
+    签名；把它原样作为 `cursor` 参数传回即取得下一页，取 `limit + 1` 行判定
+    是否还有下一页。
+    - 游标被篡改、伪造签名或结构非法 → **400** `invalid_cursor`；
+    - 游标携带的过滤条件与本次查询参数（`chain_id` / `holder` / `role` /
+      `created_from` / `created_to`）不一致 → **400**
+      `cursor_filter_mismatch`；两种情况下服务端**都不会回退为一次新查询**
+      （过滤条件变化时须重新发起首次查询）；`limit` 允许在 1～100 间逐页
+      调整，不影响游标一致性；
+    - **无更多项时 `next_cursor` 为 `null`**；空结果同样为 `null`。
+    - 轮换 `AUDIT_CURSOR_SECRET` 后此前签发的游标立即失效（400
+      `invalid_cursor`），不影响已落库事件。
 - **完整性校验**：服务端从创世记录起逐条重算哈希、校验序号连续性与 `prev_hash`
   指针，并比对链尾缓存；校验结果给出 **首个断裂序号 `first_broken_seq`**。
 - **交接事件的可选择披露证明（Merkle 包含证明）**：无需公开整条链，即可向第三方
@@ -238,6 +272,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET`  | `/offers/{offer_id}/witnesses` | 查询见证表态状态与计数（不含令牌摘要；无见证邀约 404） |
 | `GET`  | `/offers/{offer_id}` | 查询单个邀约状态与 replaces / replaced_by 替换关系（pending / accepted / expired / rejected / terminated / cancelled / replaced） |
 | `GET`  | `/chains` | 列出全部链条 |
+| `GET`  | `/audit/events` | 交接事件审计检索：跨链按 (created_at, id) 升序，支持 chain_id/holder/role（giver/receiver/either，创世事件仅 either 时按首位持有人匹配）/created_from/created_to/limit（1～100）；首次查询固定快照上界，next_cursor 为 HMAC 签名不透明游标，篡改或过滤条件不符 400 且不回退，无更多项 null |
 | `GET`  | `/chains/{chain_id}` | 查询链条与全部事件 |
 | `POST` | `/chains/{chain_id}/seals` | 创建争议封存（当前链尾 + 原因 + 有效期 + 一次性解封码；同链仅一个生效封存，重复 409） |
 | `POST` | `/seals/{seal_id}/release` | 凭一次性解封码提前解封（错码 403；重复解封/已过期 409；不动哈希链） |
@@ -278,7 +313,14 @@ cancelled / replaced / rejected / expired / terminated，或创建时未提供�
 `cancel_code_mismatch`（撤销码错误：撤销或原子替换时原撤销码不匹配）、
 `release_code_mismatch`（封存解封码错误）；
 **400** —— `too_many_seqs`（批量证明去重后超过 20 个事件序号）、
-`too_few_seqs`（批量证明未提供任何有效序号）；
+`too_few_seqs`（批量证明未提供任何有效序号）、
+`invalid_cursor`（审计检索游标被篡改、签名失效或结构非法，**不回退为新查询**）、
+`cursor_filter_mismatch`（审计翻页游标与本次过滤条件 chain_id/holder/role/
+created_from/created_to 不符，**不回退为新查询**）、
+`role_requires_holder`（未提供 holder 却指定 role=giver/receiver）、
+`invalid_limit`（审计检索 limit 不在 1～100；经查询参数越界校验时为 422）、
+`invalid_created_from` / `invalid_created_to`（时间参数不是合法 ISO-8601）、
+`invalid_time_range`（created_from 晚于 created_to）；
 **404** —— 链条、邀约、封存不存在，或对无见证邀约查询 `witness_mode_not_found`、
 对从未有过封存的链查询最新封存 `seal_not_found`、查询 Merkle 证明时事件序号
 越界（含负数）`event_not_found`（单事件与批量证明一致）。
@@ -631,6 +673,44 @@ curl -s -X POST http://localhost:8000/proofs/verify-batch \
 curl -i "http://localhost:8000/chains/ab12.../events/proof?seq=0&seq=1&...&seq=20"
 ```
 
+### 交接事件审计检索示例
+
+```bash
+# 1) 全量审计（跨链，按 created_at + 事件 id 升序），每页最多 100 条
+curl -s "http://localhost:8000/audit/events?limit=100"
+# {
+#   "events": [
+#     {"id": 1, "chain_id": "ab12...", "seq": 0, "giver": "", "receiver": "",
+#      "nonce": "", "event_hash": "9f0c...", "created_at": "2026-09-20T03:00:00+00:00"},
+#     {"id": 2, "chain_id": "7c4e...", "seq": 1, "giver": "alice", "receiver": "bob",
+#      "nonce": "n-0001", "event_hash": "...", "created_at": "2026-09-20T03:05:00+00:00"}
+#   ],
+#   "next_cursor": null,                 # 无更多项时为 null
+#   "snapshot_max_id": 2                 # 本次遍历固定的快照上界
+# }
+
+# 2) 按参与方与角色过滤：alice 作为交出方或接收方（either 时创世事件按
+#    首位持有人一并命中）
+curl -s "http://localhost:8000/audit/events?holder=alice&role=either"
+curl -s "http://localhost:8000/audit/events?holder=alice&role=giver"
+
+# 3) 时间窗（UTC 闭区间）+ 单链
+curl -s "http://localhost:8000/audit/events?chain_id=ab12...\
+&created_from=2026-09-01T00:00:00%2B00:00\
+&created_to=2026-09-30T23:59:59%2B00:00"
+
+# 4) 翻页：把上一页 next_cursor 原样传回（过滤条件必须与首次查询完全一致，
+#    limit 可逐页调整）；快照上界固定，翻页期间的新移交不会造成重复/漏项
+curl -s "http://localhost:8000/audit/events?limit=50&cursor=<上一页 next_cursor>"
+
+# 5) 错误情形（均返回 400，且不会回退为新查询）：
+#    篡改/伪造游标         -> {"error":"invalid_cursor", ...}
+#    翻页时改动过滤条件     -> {"error":"cursor_filter_mismatch", ...}
+#    无 holder 指定角色     -> {"error":"role_requires_holder", ...}
+#    created_from 晚于 to   -> {"error":"invalid_time_range", ...}
+#    limit=0 / limit=101    -> 422（查询参数校验）
+```
+
 哈希细节（三种固定域分隔，互不构成第二原像）：
 
 - 叶子：`SHA256("merkle-leaf:v1:" + sort_keys_json({"chain_id":…,"event_hash":…,"seq":…}))`
@@ -704,12 +784,13 @@ curl -i "http://localhost:8000/chains/ab12.../events/proof?seq=0&seq=1&...&seq=2
 .
 ├── app/
 │   ├── main.py        # FastAPI 路由与启动
-│   ├── service.py     # 哈希链核心逻辑（创建 / 追加 / 邀约确认 / 撤销 / 原子替换 / 见证 / 争议封存 / 查询 / 校验 / Merkle 包含证明与批量 multiproof 的生成与校验）
+│   ├── service.py     # 哈希链核心逻辑（创建 / 追加 / 邀约确认 / 撤销 / 原子替换 / 见证 / 争议封存 / 查询 / 校验 / Merkle 包含证明与批量 multiproof / 交接事件审计检索的生成与校验）
+│   ├── audit.py       # 审计检索：过滤条件归一化、快照上界与 HMAC 签名防篡改翻页游标的编解码（不透明令牌）
 │   ├── merkle.py      # Merkle 包含证明纯函数：叶子/内部节点/快照摘要、单事件与批量 multiproof 的构造与离线重算（不读数据库）
 │   ├── database.py    # SQLite 连接、建表与旧 offers 表重建迁移、串行写事务
 │   ├── hashing.py     # 紧凑 JSON 规范与 SHA-256
 │   ├── schemas.py     # Pydantic 请求/响应模型
-│   └── config.py      # 路径与端口配置
+│   └── config.py      # 路径、端口与 AUDIT_CURSOR_SECRET 配置
 ├── Dockerfile
 ├── docker-compose.yml
 ├── docker-entrypoint.sh
@@ -725,3 +806,14 @@ curl -i "http://localhost:8000/chains/ab12.../events/proof?seq=0&seq=1&...&seq=2
 | `DB_PATH` | `$DATA_DIR/handoff.db` | SQLite 文件路径 |
 | `PORT` | `8000` | 监听端口（容器内，Compose 映射同为 8000） |
 | `HOST` | `0.0.0.0` | 监听地址 |
+| `AUDIT_CURSOR_SECRET` | 内置开发默认值（Compose 同默认，均可覆盖） | `GET /audit/events` 翻页游标的 HMAC-SHA256 签名密钥。保持默认即可一键启动；**生产部署必须覆盖为高强度随机值**，如 `AUDIT_CURSOR_SECRET="$(openssl rand -hex 32)" docker compose up -d`（或写入 `.env`）。换钥后旧游标立即失效（400 `invalid_cursor`），不影响已落库数据 |
+
+### `AUDIT_CURSOR_SECRET` 部署说明
+
+- 不设置时，应用与 `docker-compose.yml` 都使用**同一个可覆盖的开发默认值**
+  （`dev-only-insecure-audit-cursor-secret-change-me`），因此
+  `docker compose up --build` 仍然一键启动；启动日志会在检测到默认密钥时输出
+  一条覆盖告警。
+- 生产环境务必通过环境变量（或 Compose 的 `.env` 文件）覆盖。游标只是防篡改的
+  翻页凭证、不包含敏感业务数据，但攻击者知道密钥即可自行构造游标，绕过过滤
+  条件一致性校验，故不应沿用开发默认值。

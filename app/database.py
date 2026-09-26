@@ -112,6 +112,11 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_chain_seq
     ON events(chain_id, seq);
 
+-- 审计检索（GET /audit/events）跨链按 (created_at, id) 升序做 keyset 翻页，
+-- 时间窗过滤与续页游标都命中该复合索引，避免全表排序。
+CREATE INDEX IF NOT EXISTS idx_events_created_id
+    ON events(created_at, id);
+
 CREATE TABLE IF NOT EXISTS offers (
 {_OFFERS_COLUMNS}
 );

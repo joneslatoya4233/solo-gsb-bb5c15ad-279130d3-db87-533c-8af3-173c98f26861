@@ -125,6 +125,24 @@
   中仅 seq、event_hash 参与重算）。首个失败阶段按 event_count -> events ->
   proof_nodes -> merkle_root -> snapshot_digest 顺序返回；重复或越界序号、
   缺失或多余节点、坐标冲突、不符合奇数层自复制规则的证明一律拒绝。
+
+交接事件审计检索（GET /audit/events）
+-------------------------------------
+跨链检索创世与移交事件，结果固定按 (created_at, 事件数据库 id) 全局升序。
+- 过滤参数：chain_id、holder（配合 role=giver/receiver/either）、
+  created_from / created_to（UTC 秒精度闭区间）、limit（1～100）。
+- 创世事件（seq=0）没有 giver/receiver 字段：仅当 role=either 时按
+  chains.first_holder（首位持有人）参与持有人匹配；giver/receiver 角色下
+  只匹配移交事件。
+- 首次查询在同一读事务内把当时最大事件 id 固定为快照上界 max_id（空库为
+  0），并经 next_cursor 携带；翻页始终只检索 id <= max_id 的快照集合，
+  翻页期间新追加的移交不会插入旧页（重复）或移动末页边界（漏项）。
+- next_cursor 为不透明令牌，携带过滤条件摘要、max_id 与末条排序键
+  (last_created_at, last_event_id)，由 app.audit 用 AUDIT_CURSOR_SECRET
+  做 HMAC-SHA256 签名；续页以 (created_at, id) 严格大于末条键的 keyset
+  方式继续。游标签名失败/结构非法 -> 400 invalid_cursor；与本次过滤条件
+  不符 -> 400 cursor_filter_mismatch；二者均不回退为新查询。无更多项时
+  next_cursor 为 null。
 """
 from __future__ import annotations
 
@@ -133,6 +151,12 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from .audit import (
+    AuditError,
+    build_filter,
+    decode_cursor,
+    encode_cursor,
+)
 from .database import read_tx, write_tx
 from .hashing import canonical_json, digest_hex
 from . import merkle
@@ -1168,6 +1192,161 @@ def list_chains() -> list[dict[str, Any]]:
         }
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# 交接事件审计检索（跨链过滤 + 快照上界 + HMAC 签名 keyset 翻页）
+# ---------------------------------------------------------------------------
+
+# 审计检索每页条数上下限（与路由 Query 约束保持一致）
+AUDIT_LIMIT_MIN = 1
+AUDIT_LIMIT_MAX = 100
+
+
+def _audit_event_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """审计事件行 -> 对外字典：相比链内事件额外携带 chain_id 与事件库 id。"""
+    return {
+        "id": row["id"],
+        "chain_id": row["chain_id"],
+        "seq": row["seq"],
+        "prev_hash": row["prev_hash"],
+        "giver": row["giver"],
+        "receiver": row["receiver"],
+        "nonce": row["nonce"],
+        "event_hash": row["event_hash"],
+        "created_at": row["created_at"],
+    }
+
+
+def search_audit_events(
+    chain_id: Optional[str],
+    holder: Optional[str],
+    role: str,
+    created_from: Optional[str],
+    created_to: Optional[str],
+    limit: int,
+    cursor: Optional[str],
+) -> dict[str, Any]:
+    """跨链检索交接事件，按 (created_at, 事件数据库 id) 全局升序返回。
+
+    快照与翻页
+    ~~~~~~~~~~
+    - 首次查询（cursor 缺省）在**同一个读事务**内取当时最大事件 id 作为快照
+      上界 max_id 并随 next_cursor 固定下来；翻页期间新追加的移交事件 id
+      大于 max_id，永不出现在本次遍历中，因此不会插入旧页造成重复，也不会
+      移动末页边界造成漏项。
+    - 翻页查询先对游标做 HMAC 验签与过滤摘要比对（篡改 / 条件不符均 400，
+      绝不回退为新查询），再以 (created_at, id) 严格大于上一页末条排序键的
+      keyset 方式继续。
+    - 取 limit + 1 行判定是否还有下一页；没有更多项时 next_cursor 为 null。
+
+    角色匹配
+    ~~~~~~~~
+    - role=giver / receiver 只匹配移交事件（seq >= 1）的 giver / receiver；
+    - role=either 匹配 giver 或 receiver，且创世事件（seq=0，无 giver /
+      receiver 字段）按 chains.first_holder（首位持有人）参与匹配；
+    - 未指定 holder 时返回全部事件（role 必须为 either，否则 400）。
+
+    时间过滤为闭区间 created_from <= created_at <= created_to（UTC 秒精度）。
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool) or not (
+        AUDIT_LIMIT_MIN <= limit <= AUDIT_LIMIT_MAX
+    ):
+        raise AuditError(
+            "invalid_limit",
+            f"limit 必须是 {AUDIT_LIMIT_MIN}～{AUDIT_LIMIT_MAX} 的整数",
+        )
+
+    flt = build_filter(
+        chain_id=chain_id,
+        holder=holder,
+        role=role,
+        created_from=created_from,
+        created_to=created_to,
+    )
+
+    if cursor is not None and cursor.strip():
+        max_id, last_created_at, last_event_id = decode_cursor(cursor, flt)
+    else:
+        max_id, last_created_at, last_event_id = (None, None, None)
+
+    clauses = ["e.id <= ?"]
+    params: list[Any] = []
+    max_id_param_index = 0  # 快照上界在事务内确定后回填
+    params.append(None)
+
+    if flt.chain_id is not None:
+        clauses.append("e.chain_id = ?")
+        params.append(flt.chain_id)
+    if flt.created_from is not None:
+        clauses.append("e.created_at >= ?")
+        params.append(flt.created_from)
+    if flt.created_to is not None:
+        clauses.append("e.created_at <= ?")
+        params.append(flt.created_to)
+
+    if flt.holder is not None:
+        if flt.role == "giver":
+            # 创世事件 giver 为空串，天然不命中精确匹配。
+            clauses.append("e.giver = ?")
+            params.append(flt.holder)
+        elif flt.role == "receiver":
+            # 创世事件 receiver 为空串，天然不命中精确匹配。
+            clauses.append("e.receiver = ?")
+            params.append(flt.holder)
+        else:  # either：移交事件任一参与方，或创世事件按首位持有人匹配
+            clauses.append(
+                "(e.giver = ? OR e.receiver = ?"
+                " OR (e.seq = 0 AND c.first_holder = ?))"
+            )
+            params.extend([flt.holder, flt.holder, flt.holder])
+
+    if last_created_at is not None:
+        # keyset 续页：排序键 (created_at, id) 严格大于上一页末条。
+        clauses.append(
+            "(e.created_at > ? OR (e.created_at = ? AND e.id > ?))"
+        )
+        params.extend([last_created_at, last_created_at, last_event_id])
+
+    # 创世事件的首位持有人来自 chains 头；role=either 的 holder 匹配需要
+    # chains 表。其余路径下 LEFT JOIN 不改变结果行数（每事件必有一条链）。
+    sql = (
+        "SELECT e.* FROM events e"
+        " LEFT JOIN chains c ON c.chain_id = e.chain_id"
+        " WHERE " + " AND ".join(clauses)
+        + " ORDER BY e.created_at ASC, e.id ASC"
+        " LIMIT ?"
+    )
+
+    with read_tx() as conn:
+        if max_id is None:
+            row = conn.execute("SELECT MAX(id) AS max_id FROM events").fetchone()
+            # 空库时 MAX(id) 为 NULL：快照上界取 0，任何事件 id >= 1 都不
+            # 会落在快照内（空结果即正确）。
+            max_id = row["max_id"] if row["max_id"] is not None else 0
+        params[max_id_param_index] = max_id
+
+        rows = conn.execute(sql, (*params, limit + 1)).fetchall()
+
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    events = [_audit_event_row_to_dict(r) for r in page]
+
+    next_cursor: Optional[str] = None
+    if has_more:
+        last = page[-1]
+        next_cursor = encode_cursor(
+            flt,
+            max_id=max_id,
+            last_created_at=last["created_at"],
+            last_event_id=last["id"],
+        )
+
+    return {
+        "events": events,
+        "next_cursor": next_cursor,
+        "snapshot_max_id": max_id,
+    }
 
 
 def verify_chain(chain_id: str) -> dict[str, Any]:
